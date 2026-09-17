@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sia_storage::{DownloadOptions, Object, Sdk, UploadOptions};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -89,17 +90,35 @@ where
     (handles, rx)
 }
 
+fn progress_bar(mp: &MultiProgress, index: u32, size: u64) -> ProgressBar {
+    let style = ProgressStyle::with_template(
+        "file {prefix:>5}  {bar:30} {bytes:>10} / {total_bytes:<10} {bytes_per_sec:>12}  {eta:>4}",
+    )
+    .expect("valid template");
+    mp.add(
+        ProgressBar::new(size)
+            .with_style(style)
+            .with_prefix(index.to_string()),
+    )
+}
+
 async fn upload_one(
     sdk: &Sdk,
     index: u32,
     size: u64,
     seed: u64,
     options: UploadOptions,
+    mp: &MultiProgress,
 ) -> Result<Uploaded> {
     let data = Data::new(seed, index, size);
+    let progress = progress_bar(mp, index, size);
     let start = Instant::now();
     let object = sdk
-        .upload(Object::default(), data.reader(), options)
+        .upload(
+            Object::default(),
+            progress.wrap_async_read(data.reader()),
+            options,
+        )
         .await
         .context("upload")?;
     Ok(Uploaded {
@@ -133,6 +152,7 @@ async fn download_one(
     record: &Record,
     seed: u64,
     options: DownloadOptions,
+    mp: &MultiProgress,
 ) -> Result<Sample> {
     let data = Data::new(seed, record.index, record.size);
     // The verifier's clock starts here, so the object lookup the download needs
@@ -142,7 +162,9 @@ async fn download_one(
         .object(&record.object_id)
         .await
         .context("object lookup")?;
-    let mut download = sdk.download(&object, options).context("download")?;
+    let progress = progress_bar(mp, record.index, record.size);
+    let mut download =
+        progress.wrap_async_read(sdk.download(&object, options).context("download")?);
     tokio::io::copy(&mut download, &mut verifier)
         .await
         .context("download")?;
@@ -210,14 +232,17 @@ pub async fn upload(sdk: Sdk, args: UploadArgs) -> Result<()> {
     println!("  {:<16}{}", "Manifest", manifest_path.display());
     warn_on_quota(&sdk, total_bytes).await;
 
+    let progress = MultiProgress::new();
     let sampler = Sampler::start();
     let started = Instant::now();
     let (handles, mut outcomes) = spawn_pool(count, concurrency, {
         let sdk = sdk.clone();
+        let progress = progress.clone();
         move |index| {
             let sdk = sdk.clone();
             let options = options.clone();
-            async move { upload_one(&sdk, index, size, seed, options).await }
+            let progress = progress.clone();
+            async move { upload_one(&sdk, index, size, seed, options, &progress).await }
         }
     });
 
@@ -237,17 +262,17 @@ pub async fn upload(sdk: Sdk, args: UploadArgs) -> Result<()> {
                         Outcome { index, result }
                     });
                 }
-                Err(e) => eprintln!("file {:>5}  FAILED: {e:#}", outcome.index),
+                Err(e) => progress.suspend(|| eprintln!("file {:>5}  FAILED: {e:#}", outcome.index)),
             },
             Some(pinned) = pins.join_next() => match pinned {
                 Ok(Outcome { result: Ok(record), .. }) => {
-                    eprintln!(
+                    progress.suspend(|| eprintln!(
                         "file {:>5}  uploaded {} in {} ({})",
                         record.index,
                         ByteSize(record.size),
                         units::duration(record.elapsed()),
                         units::bitrate(bits_per_second(record.size, record.elapsed()))
-                    );
+                    ));
                     samples.push(Sample {
                         index: record.index,
                         bytes: record.size,
@@ -260,9 +285,9 @@ pub async fn upload(sdk: Sdk, args: UploadArgs) -> Result<()> {
                     manifest.save(&manifest_path)?;
                 }
                 Ok(Outcome { index, result: Err(e) }) => {
-                    eprintln!("file {index:>5}  FAILED: {e:#}")
+                    progress.suspend(|| eprintln!("file {index:>5}  FAILED: {e:#}"))
                 }
-                Err(e) => eprintln!("pin task failed: {e}"),
+                Err(e) => progress.suspend(|| eprintln!("pin task failed: {e}")),
             },
             // Every worker has exited and every pin has landed.
             else => break,
@@ -317,15 +342,18 @@ pub async fn download(sdk: Sdk, args: DownloadArgs) -> Result<()> {
     let records = Arc::new(manifest.files);
     let attempted = records.len();
     let seed = manifest.seed;
+    let progress = MultiProgress::new();
     let sampler = Sampler::start();
     let started = Instant::now();
     let (handles, mut outcomes) = spawn_pool(attempted as u32, concurrency, {
         let records = records.clone();
+        let progress = progress.clone();
         move |slot| {
             let sdk = sdk.clone();
             let options = options.clone();
             let records = records.clone();
-            async move { download_one(&sdk, &records[slot as usize], seed, options).await }
+            let progress = progress.clone();
+            async move { download_one(&sdk, &records[slot as usize], seed, options, &progress).await }
         }
     });
 
@@ -333,19 +361,23 @@ pub async fn download(sdk: Sdk, args: DownloadArgs) -> Result<()> {
     while let Some(outcome) = outcomes.recv().await {
         match outcome.result {
             Ok(sample) => {
-                eprintln!(
-                    "file {:>5}  downloaded {} in {} ({})",
-                    sample.index,
-                    ByteSize(sample.bytes),
-                    units::duration(sample.elapsed),
-                    units::bitrate(sample.bps())
-                );
+                progress.suspend(|| {
+                    eprintln!(
+                        "file {:>5}  downloaded {} in {} ({})",
+                        sample.index,
+                        ByteSize(sample.bytes),
+                        units::duration(sample.elapsed),
+                        units::bitrate(sample.bps())
+                    )
+                });
                 samples.push(sample);
             }
-            Err(e) => eprintln!(
-                "file {:>5}  FAILED: {e:#}",
-                records[outcome.index as usize].index
-            ),
+            Err(e) => progress.suspend(|| {
+                eprintln!(
+                    "file {:>5}  FAILED: {e:#}",
+                    records[outcome.index as usize].index
+                )
+            }),
         }
     }
     let wall = started.elapsed();
